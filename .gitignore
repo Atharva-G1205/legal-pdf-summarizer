@@ -1,0 +1,5 @@
+# Exclude large and unnecessary folders
+organized_legal_dataset/
+project_referenes/
+summarization/
+roadmap.pdf
