@@ -3,3 +3,7 @@ organized_legal_dataset/
 project_referenes/
 summarization/
 roadmap.pdf
+venv/
+tests/
+data/
+__pycache__

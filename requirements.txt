@@ -1,0 +1,10 @@
+# Core PDF processing
+pdfplumber>=0.10.0
+
+# OCR support (optional but recommended)
+pytesseract>=0.3.10
+pdf2image>=1.16.0
+Pillow>=10.0.0
+
+# Utility libraries
+tqdm>=4.65.0
