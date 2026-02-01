@@ -1,6 +1,6 @@
 """
 PDF Loader Module -
-Handles text extraction for text based and scanned
+Handles text extraction for text based and scanned PDFs
 """
 
 import os
@@ -184,7 +184,7 @@ class PDFLoader:
         if image.width < min_width:
             scale_factor = min_width / image.width
             new_size = (int(image.width * scale_factor), int(image.height * scale_factor))
-            image = image.resize(new_size, Image.LANCZOS)
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
             logger.debug(f"Upscaled image to {new_size}")
         
         # Convert to grayscale
@@ -204,7 +204,12 @@ class PDFLoader:
                 # Fallback to simple thresholding
                 image = ImageOps.autocontrast(image)
                 threshold = 180
-                image = image.point(lambda p: 255 if p > threshold else 0)
+
+                # documentation recommended approach
+                table = [255 if i > threshold else 0 for i in range(256)]
+                image = image.point(table)
+
+                # image = image.point(lambda p: 255 if int(p) > threshold else 0)
         
         elif method == 'simple':
             # Simple contrast enhancement and thresholding
@@ -215,7 +220,8 @@ class PDFLoader:
             
             # Simple thresholding
             threshold = 180
-            image = image.point(lambda p: 255 if p > threshold else 0)
+            table = [255 if i > threshold else 0 for i in range(256)]
+            image = image.point(table)
         
         elif method == 'aggressive':
             # More aggressive preprocessing for very poor quality scans
@@ -237,7 +243,8 @@ class PDFLoader:
             except:
                 # Fallback
                 image = ImageOps.autocontrast(image)
-                image = image.point(lambda p: 255 if p > 170 else 0)
+                table = [255 if i > 170 else 0 for i in range(256)]
+                image = image.point(table)
         
         return image
     
@@ -490,7 +497,6 @@ def main():
     loader = PDFLoader(ocr_enabled=True)
     
     project_root = Path(__file__).parent.parent
-    pdf_dir = project_root / "organized_legal_dataset" / "test"
     output_dir = project_root / "data" / "extracted_text"
     output_dir.mkdir(exist_ok=True, parents=True)
 
