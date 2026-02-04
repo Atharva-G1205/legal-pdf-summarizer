@@ -8,3 +8,8 @@ Pillow>=10.0.0
 
 # Utility libraries
 tqdm>=4.65.0
+
+# Embedding and ML (for InLegalBERT)
+transformers>=4.30.0
+torch>=2.0.0
+numpy>=1.24.0
