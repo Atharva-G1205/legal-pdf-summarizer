@@ -23,7 +23,7 @@ __all__ = [
     'PDFLoader',
     # Preprocessor
     'TextPreprocessor', 'PageType',
-    'preprocess', 'preprocess_file', 'preprocess_directory', 'process_path',
+    'preprocess', 'preprocess_file', 'preprocess_directory',
     'get_summarization_text', 'get_sections', 'get_clean_text',
     'get_metadata', 'get_citations', 'preprocess_main',
     # Chunker

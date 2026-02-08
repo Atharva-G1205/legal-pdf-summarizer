@@ -35,11 +35,11 @@ class PDFLoader:
     Handles PDF ingestion with automatic detection of PDF type and OCR fallback.
     
     Features:
-    - Text-based PDF extraction using pdfplumber
-    - Enhanced OCR fallback using Tesseract for scanned PDFs
-    - Automatic PDF type detection
-    - Per-page text extraction
-    - Advanced image preprocessing for better OCR accuracy
+    1. Text-based PDF extraction using pdfplumber
+    2. Enhanced OCR fallback using Tesseract for scanned PDFs
+    3. Automatic PDF type detection
+    4. Per-page text extraction
+    5. Advanced image preprocessing for better OCR accuracy
     """
     
     def __init__(self, ocr_enabled: bool = True):

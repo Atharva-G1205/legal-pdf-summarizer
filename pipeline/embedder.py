@@ -1,15 +1,13 @@
 """
-Legal Embedder Module - Step 4 of Summarization Pipeline
-=========================================================
-
+Legal Embedder Module
 Generates semantic embeddings for text chunks using InLegalBERT,
 a BERT model pretrained on Indian legal documents.
 
 Features:
-- Loads law-ai/InLegalBERT from HuggingFace (or local cache)
-- GPU acceleration with automatic device detection
-- Batch processing for efficiency
-- Mean pooling for chunk-level embeddings
+1. Loads law-ai/InLegalBERT from HuggingFace (or local cache)
+2. GPU acceleration with automatic device detection
+3. Batch processing for efficiency
+4. Mean pooling for chunk-level embeddings
 
 Usage:
     from pipeline.embedder import LegalEmbedder, embed_chunks

@@ -50,6 +50,7 @@ class Chunk:
     char_start: int
     char_end: int
     section: Optional[str] = None
+    source_file: Optional[str] = None
     
     def __repr__(self):
         preview = self.text[:50] + '...' if len(self.text) > 50 else self.text
@@ -330,9 +331,7 @@ class DocumentChunker:
         return chunks
 
 
-# =============================================================================
 # CONVENIENCE FUNCTIONS
-# =============================================================================
 
 # Singleton instance
 _chunker: Optional[DocumentChunker] = None

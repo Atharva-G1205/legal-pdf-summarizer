@@ -235,7 +235,7 @@ class TextCleaner:
     
     def clean_basic(self, text: str, header: Optional[str] = None) -> str:
         """Apply basic cleaning operations."""
-        text = self.remove_repeated_headers(text, header)
+        text = self.remove_repeated_headers(text, header) # type: ignore
         text, _ = self.remove_footers(text)
         text = self.remove_page_numbers(text)
         text = self.normalize_whitespace(text)
