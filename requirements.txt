@@ -9,7 +9,8 @@ Pillow>=10.0.0
 # Utility libraries
 tqdm>=4.65.0
 
-# Embedding and ML (for InLegalBERT)
+# Embedding and ML (for InLegalBERT + Legal-Pegasus)
 transformers>=4.30.0
 torch>=2.0.0
 numpy>=1.24.0
+sentencepiece>=0.1.99  # For Pegasus tokenizer

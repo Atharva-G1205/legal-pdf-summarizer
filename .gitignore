@@ -7,3 +7,6 @@ venv/
 tests/
 data/
 __pycache__
+models/
+*.md
+.python-version

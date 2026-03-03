@@ -41,6 +41,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Default directory where processed files are stored
+# Resolves to <project_root>/data/processed/ regardless of cwd
+PROCESSED_DIR: Path = Path(__file__).resolve().parent.parent / "data" / "processed"
+
 # Module exports
 __all__ = [
     'TextPreprocessor',
@@ -483,29 +487,34 @@ def preprocess_file(
     output_path: Optional[Union[str, Path]] = None
 ) -> Dict[str, Any]:
     """
-    Process a single JSON file.
-    
+    Process a single JSON file and save the result to disk.
+
     Args:
         input_path: Path to input JSON file
-        output_path: Optional output path for results
-    
+        output_path: Output path for results.  When omitted, the processed
+                     file is saved to ``PROCESSED_DIR`` (data/processed/)
+                     using the same filename as the input.
+
     Returns:
         Processed document dict
     """
     input_path = Path(input_path)
-    
+
     with open(input_path, 'r', encoding='utf-8') as f:
         document = json.load(f)
-    
+
     result = preprocess(document)
-    
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        logger.info(f"Saved processed file to: {output_path}")
-    
+
+    # Default to PROCESSED_DIR when no explicit output path is given
+    if output_path is None:
+        output_path = PROCESSED_DIR / input_path.name
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    logger.info(f"Saved processed file to: {output_path}")
+
     return result
 
 
@@ -699,12 +708,12 @@ Examples:
         logger.error(f"Input path not found: {args.input}")
         return
     
-    # Default output path
+    # Default output path → data/processed/
     if args.output is None:
         if args.input.is_file():
-            args.output = args.input.parent / f"{args.input.stem}_processed.json"
+            args.output = PROCESSED_DIR / args.input.name
         else:
-            args.output = args.input.parent / f"{args.input.name}_processed"
+            args.output = PROCESSED_DIR
     
     # Process
     try:

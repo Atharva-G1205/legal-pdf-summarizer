@@ -1,11 +1,14 @@
 """
 Pipeline Module - Legal PDF Processing Pipeline
 
-Provides tools for extracting, preprocessing, chunking, and embedding legal PDF documents.
+End-to-end pipeline for legal PDF summarization:
+PDF → Extract → Preprocess → Chunk → Embed → Retrieve → Summarize
 
 Usage:
-    from pipeline import preprocess, chunk_document, embed_chunks
-    from pipeline import PDFLoader, TextPreprocessor, DocumentChunker, LegalEmbedder
+    from pipeline import (
+        PDFLoader, preprocess, chunk_text, 
+        LegalEmbedder, select_chunks, summarize_document
+    )
 """
 
 # Import all public exports from each module
@@ -13,6 +16,8 @@ from pipeline.pdf_loader import *
 from pipeline.preprocessor import *
 from pipeline.chunker import *
 from pipeline.embedder import *
+from pipeline.retriever import *
+from pipeline.summarizer import *
 
 # Alias for CLI entry point
 from pipeline.preprocessor import main as preprocess_main
@@ -30,4 +35,8 @@ __all__ = [
     'DocumentChunker', 'Chunk', 'chunk_text', 'chunk_document',
     # Embedder
     'LegalEmbedder', 'EmbeddingResult', 'embed_text', 'embed_chunks',
+    # Retriever
+    'LegalRetriever', 'select_chunks', 'LEGAL_INTENT_QUERIES',
+    # Summarizer
+    'LegalSummarizer', 'summarize_document', 'summarize_chunks',
 ]
