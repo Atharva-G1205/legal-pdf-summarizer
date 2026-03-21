@@ -38,10 +38,12 @@ export async function fetchSummaryLevels(): Promise<SummaryLevel[]> {
 export async function summarizePdf(
   file: File,
   level: number,
+  modelSource: "finetuned" | "huggingface" = "finetuned",
 ): Promise<SummaryResponse> {
   const form = new FormData();
   form.append("file", file);
   form.append("level", String(level));
+  form.append("model_source", modelSource);
 
   const res = await fetch(`${API_BASE}/api/summarize`, {
     method: "POST",

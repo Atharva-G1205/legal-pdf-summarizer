@@ -43,6 +43,7 @@ class SummaryConfig:
     min_length: int
     description: str
     backend: str = 'local'
+    model_source: str = 'finetuned'   # 'finetuned' or 'huggingface'
     chunk_words: int = 400
     chunk_overlap: int = 50
 
@@ -73,7 +74,7 @@ SUMMARY_CONFIGS: Dict[SummaryLevel, SummaryConfig] = {
     SummaryLevel.EXECUTIVE: SummaryConfig(
         name='Executive',
         emoji='📋',
-        model=MODELS['led'],           # LED: fast, handles long input
+        model=MODELS['pegasus'],        # Pegasus: higher quality for concise summaries
         top_n=20,                       # ~700 words of ground truth
         max_length=350,
         min_length=150,

@@ -99,9 +99,15 @@ def flatten_sentences(processed_doc: dict) -> List[Dict[str, Any]]:
     return out
 
 
-def run_pipeline(pdf_path: Path, config: SummaryConfig) -> str:
+def run_pipeline(pdf_path: Path, config: SummaryConfig, model_source: str | None = None) -> str:
     """
     Execute the full summarization pipeline and return the summary string.
+
+    Args:
+        pdf_path:     Path to the PDF file.
+        config:       SummaryConfig for the chosen level.
+        model_source: Optional override — ``'finetuned'`` or ``'huggingface'``.
+                      If None, uses value from config.
     """
 
     # 1. Load PDF -------------------------------------------------------
@@ -143,9 +149,12 @@ def run_pipeline(pdf_path: Path, config: SummaryConfig) -> str:
         ]
         return "\n".join(lines)
 
+    # Resolve model source
+    effective_source = model_source or config.model_source
+
     # --- Abstractive mode ---
-    _step("🤖", f"Loading {config.name} summarizer (model: {config.model})…")
-    summarizer = LegalSummarizer(model_key=config.model)
+    _step("🤖", f"Loading {config.name} summarizer (model: {config.model}, source: {effective_source})…")
+    summarizer = LegalSummarizer(model_key=config.model, model_source=effective_source)
 
     _step("📝", f"Generating {config.name} summary…")
     grounding = {

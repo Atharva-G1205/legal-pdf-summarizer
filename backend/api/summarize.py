@@ -67,6 +67,7 @@ async def list_summary_levels() -> List[SummaryLevelInfo]:
 async def summarize_pdf(
     file: UploadFile = File(..., description="The PDF file to summarize"),
     level: int = Form(1, description="Summary level (1-4)"),
+    model_source: str = Form("finetuned", description="Model source: 'finetuned' or 'huggingface'"),
 ) -> SummaryResponse:
     """
     Accept a PDF upload and a summary-level choice, run the full
@@ -76,6 +77,10 @@ async def summarize_pdf(
     # Validate file type
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
+
+    # Validate model_source
+    if model_source not in ("finetuned", "huggingface"):
+        raise HTTPException(status_code=400, detail="model_source must be 'finetuned' or 'huggingface'.")
 
     # Resolve config
     try:
@@ -93,7 +98,7 @@ async def summarize_pdf(
             tmp.write(content)
             tmp_path = Path(tmp.name)
 
-        summary = run_pipeline(tmp_path, config)
+        summary = run_pipeline(tmp_path, config, model_source=model_source)
 
         if not summary:
             raise HTTPException(

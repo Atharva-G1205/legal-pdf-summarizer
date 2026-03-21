@@ -75,8 +75,8 @@ LOCAL_MODELS: Dict[str, Path] = {
     "pegasus": _PROJECT_ROOT / "models" / "Pegasus" / "IN_pegasus_end",
 }
 
-# HuggingFace fallback names (used when local tokenizer is missing)
-_HF_FALLBACK: Dict[str, str] = {
+# HuggingFace model names (used for 'huggingface' source or tokenizer fallback)
+HF_MODELS: Dict[str, str] = {
     "led": "allenai/led-base-16384",
     "pegasus": "nsi319/legal-pegasus",
 }
@@ -116,11 +116,14 @@ class LegalSummarizer:
         self,
         model_key: str = "led",
         device: Optional[str] = None,
+        model_source: str = "finetuned",
     ):
         """
         Args:
-            model_key: ``"led"`` or ``"pegasus"`` (maps to local model dirs).
-            device:    ``"cuda"``, ``"cpu"``, or ``None`` for auto-detect.
+            model_key:     ``"led"`` or ``"pegasus"`` (maps to local model dirs).
+            device:        ``"cuda"``, ``"cpu"``, or ``None`` for auto-detect.
+            model_source:  ``"finetuned"`` loads from local `models/` dir,
+                           ``"huggingface"`` downloads from HuggingFace Hub.
         """
         _lazy_import()
 
@@ -130,7 +133,9 @@ class LegalSummarizer:
             )
 
         self.model_key = model_key
+        self.model_source = model_source
         local_path = LOCAL_MODELS[model_key]
+        hf_name = HF_MODELS[model_key]
 
         # Device
         if device is None:
@@ -138,29 +143,34 @@ class LegalSummarizer:
         else:
             self.device = device
 
-        # --- Load tokenizer ---------------------------------------------------
-        # Some local checkpoints ship without tokenizer files.
-        # Try local first; fall back to HuggingFace tokenizer.
-        tokenizer_path = local_path if (local_path / "tokenizer_config.json").exists() else None
-        if tokenizer_path:
-            logger.info(f"Loading tokenizer from local path: {tokenizer_path}")
-            self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
-        else:
-            hf_name = _HF_FALLBACK[model_key]
-            logger.info(
-                f"Local tokenizer missing at {local_path}, "
-                f"falling back to HuggingFace: {hf_name}"
-            )
+        if model_source == "huggingface":
+            # --- Load everything from HuggingFace Hub ---
+            logger.info(f"Loading {model_key} from HuggingFace: {hf_name}")
             self.tokenizer = AutoTokenizer.from_pretrained(hf_name)
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(hf_name)
+            self.model_name = hf_name
+        else:
+            # --- Load from local finetuned checkpoint ---
+            # Tokenizer: try local first, fall back to HF
+            tokenizer_path = local_path if (local_path / "tokenizer_config.json").exists() else None
+            if tokenizer_path:
+                logger.info(f"Loading tokenizer from local path: {tokenizer_path}")
+                self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
+            else:
+                logger.info(
+                    f"Local tokenizer missing at {local_path}, "
+                    f"falling back to HuggingFace: {hf_name}"
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(hf_name)
 
-        # --- Load model -------------------------------------------------------
-        logger.info(f"Loading model weights from {local_path}")
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(str(local_path))
+            # Model weights
+            logger.info(f"Loading model weights from {local_path}")
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(str(local_path))
+            self.model_name = str(local_path.name)
+
         self.model.to(self.device)
         self.model.eval()
-
-        self.model_name = str(local_path.name)
-        logger.info(f"✓ {model_key} model loaded on {self.device}")
+        logger.info(f"✓ {model_key} model loaded on {self.device} (source: {model_source})")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -405,7 +415,11 @@ def summarize_document(
     Returns:
         :class:`SummaryResult`.
     """
-    summarizer = LegalSummarizer(model_key=config.model)
+    model_source = getattr(config, "model_source", "finetuned")
+    summarizer = LegalSummarizer(
+        model_key=config.model,
+        model_source=model_source,
+    )
     return summarizer.summarize_sentences(
         sentences,
         max_length=config.max_length,
