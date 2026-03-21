@@ -14,3 +14,13 @@ transformers>=4.30.0
 torch>=2.0.0
 numpy>=1.24.0
 sentencepiece>=0.1.99  # For Pegasus tokenizer
+scipy>=1.10.0
+
+# Backend and API
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# PDF Generation
+fpdf2>=2.7.0

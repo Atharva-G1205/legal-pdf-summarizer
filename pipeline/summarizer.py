@@ -1,415 +1,575 @@
 """
-Legal Summarizer Module - Steps 8-9 of Summarization Pipeline
-===============================================================
+Legal Summarizer Module — Abstractive Summarization
+=====================================================
 
-Abstractive summarization using Legal-Pegasus (or fallback models).
+Generates summaries using locally stored Legal-LED or Legal-Pegasus models.
 
-Features:
-- Legal-Pegasus fine-tuned for legal text
-- Hierarchical summarization (chunk-level → document-level)
-- GPU acceleration with batch processing
-- Fallback to general Pegasus or Long-T5
+Designed to receive **pre-ranked sentences** (from ``retriever.rank_sentences``)
+rather than raw chunks.  This avoids the context-overflow and "word salad"
+problems documented in the project reference notes.
+
+Models are loaded from ``<project>/models/`` by key:
+  - ``led``     → models/LED/IN_model/
+  - ``pegasus`` → models/Pegasus/IN_pegasus_end/
 
 Usage:
     from pipeline.summarizer import LegalSummarizer, summarize_document
-    
-    # Quick usage
-    summary = summarize_document(selected_chunks)
-    
-    # Or with custom settings
-    summarizer = LegalSummarizer()
-    summary = summarizer.hierarchical_summary(selected_chunks)
+
+    summarizer = LegalSummarizer(model_key="led")
+    result = summarizer.summarize_text(text, max_length=350, min_length=150)
+
+    # Or convenience function
+    result = summarize_document(sentences, config)
 """
 
+from __future__ import annotations
+
 import logging
-from typing import List, Dict, Any, Optional, Union
+import re
 from dataclasses import dataclass
-import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Lazy-loaded heavy imports
+torch = None
+AutoTokenizer = None
+AutoModelForSeq2SeqLM = None
+
+
+def _lazy_import():
+    """Lazily import torch + transformers."""
+    global torch, AutoTokenizer, AutoModelForSeq2SeqLM
+    if torch is None:
+        try:
+            import torch as _torch
+            from transformers import (
+                AutoTokenizer as _AT,
+                AutoModelForSeq2SeqLM as _AM,
+            )
+            torch = _torch
+            AutoTokenizer = _AT
+            AutoModelForSeq2SeqLM = _AM
+        except ImportError as exc:
+            raise ImportError(
+                "torch and transformers are required for summarization. "
+                "Install with: pip install torch transformers"
+            ) from exc
+
+
 __all__ = [
-    'LegalSummarizer',
-    'summarize_document',
-    'summarize_chunks',
+    "LegalSummarizer",
+    "SummaryResult",
+    "summarize_document",
 ]
 
+# ---------------------------------------------------------------------------
+# Project paths
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+LOCAL_MODELS: Dict[str, Path] = {
+    "led": _PROJECT_ROOT / "models" / "LED" / "IN_model",
+    "pegasus": _PROJECT_ROOT / "models" / "Pegasus" / "IN_pegasus_end",
+}
+
+# HuggingFace fallback names (used when local tokenizer is missing)
+_HF_FALLBACK: Dict[str, str] = {
+    "led": "allenai/led-base-16384",
+    "pegasus": "nsi319/legal-pegasus",
+}
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 @dataclass
 class SummaryResult:
-    """Container for summarization results."""
+    """Container for a generated summary."""
+
     summary: str
-    chunk_summaries: Optional[List[str]] = None
-    model_name: str = ""
-    input_length: int = 0
-    output_length: int = 0
-    
-    def __repr__(self):
-        return f"SummaryResult(length={len(self.summary)} chars, model={self.model_name})"
+    model_used: str
+    input_word_count: int
+    output_word_count: int
+
+    def __repr__(self) -> str:
+        return (
+            f"SummaryResult(model={self.model_used!r}, "
+            f"in={self.input_word_count}w, out={self.output_word_count}w)"
+        )
 
 
+# ---------------------------------------------------------------------------
+# Core class
+# ---------------------------------------------------------------------------
 class LegalSummarizer:
     """
-    Abstractive summarization using Legal-Pegasus or fallback models.
-    
-    Implements hierarchical summarization:
-    1. First pass: Summarize each selected chunk
-    2. Second pass: Summarize the chunk summaries into final document summary
+    Abstractive summarizer backed by local Legal-LED / Legal-Pegasus models.
+
+    Accepts a flat string of pre-ranked sentences (typically 500–800 words)
+    and produces a concise abstractive summary.
     """
-    
-    # Model preferences (in order of priority)
-    LEGAL_PEGASUS = "nsi319/legal-pegasus"
-    PEGASUS_LARGE = "google/pegasus-large"
-    LONG_T5 = "google/long-t5-tglobal-base"
-    
+
     def __init__(
         self,
-        model_name: Optional[str] = None,
+        model_key: str = "led",
         device: Optional[str] = None,
-        max_length: int = 512,
-        min_length: int = 100,
-        batch_size: int = 4
     ):
         """
-        Initialize summarizer with model.
-        
         Args:
-            model_name: HuggingFace model name. If None, tries Legal-Pegasus first.
-            device: Device to use ('cuda', 'cpu'). If None, auto-detects.
-            max_length: Maximum summary length in tokens
-            min_length: Minimum summary length in tokens
-            batch_size: Batch size for processing multiple chunks
+            model_key: ``"led"`` or ``"pegasus"`` (maps to local model dirs).
+            device:    ``"cuda"``, ``"cpu"``, or ``None`` for auto-detect.
         """
-        self.max_length = max_length
-        self.min_length = min_length
-        self.batch_size = batch_size
-        
-        # Lazy imports
-        self._lazy_import()
-        
-        # Auto-detect device
+        _lazy_import()
+
+        if model_key not in LOCAL_MODELS:
+            raise ValueError(
+                f"Unknown model_key {model_key!r}. Choose from {list(LOCAL_MODELS)}"
+            )
+
+        self.model_key = model_key
+        local_path = LOCAL_MODELS[model_key]
+
+        # Device
         if device is None:
-            import torch
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
-        
-        # Try models in order of preference
-        self.model = None
-        self.tokenizer = None
-        self.model_name = None
-        
-        if model_name:
-            # User specified a model
-            self._load_model(model_name)
+
+        # --- Load tokenizer ---------------------------------------------------
+        # Some local checkpoints ship without tokenizer files.
+        # Try local first; fall back to HuggingFace tokenizer.
+        tokenizer_path = local_path if (local_path / "tokenizer_config.json").exists() else None
+        if tokenizer_path:
+            logger.info(f"Loading tokenizer from local path: {tokenizer_path}")
+            self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path))
         else:
-            # Try in order of preference
-            for model in [self.LEGAL_PEGASUS, self.PEGASUS_LARGE, self.LONG_T5]:
-                logger.info(f"Attempting to load {model}...")
-                if self._load_model(model):
-                    break
-            
-            if self.model is None:
-                raise RuntimeError(
-                    "Failed to load any summarization model. "
-                    "Please install transformers and try again."
-                )
-        
-        logger.info(f"✓ Loaded {self.model_name} on {self.device}")
-    
-    def _lazy_import(self):
-        """Lazy import heavy dependencies."""
-        global AutoTokenizer, AutoModelForSeq2SeqLM, torch
-        
-        try:
-            from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-            import torch
-        except ImportError as e:
-            raise ImportError(
-                "transformers and torch are required for summarization. "
-                "Install with: pip install transformers torch"
-            ) from e
-    
-    def _load_model(self, model_name: str) -> bool:
-        """
-        Try to load a model.
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            logger.info(f"Loading {model_name}...")
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-            self.model.to(self.device)
-            self.model.eval()
-            
-            self.model_name = model_name
-            return True
-            
-        except Exception as e:
-            logger.warning(f"Failed to load {model_name}: {e}")
-            return False
-    
-    def summarize_text(
+            hf_name = _HF_FALLBACK[model_key]
+            logger.info(
+                f"Local tokenizer missing at {local_path}, "
+                f"falling back to HuggingFace: {hf_name}"
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(hf_name)
+
+        # --- Load model -------------------------------------------------------
+        logger.info(f"Loading model weights from {local_path}")
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(str(local_path))
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.model_name = str(local_path.name)
+        logger.info(f"✓ {model_key} model loaded on {self.device}")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _get_input_max(self) -> int:
+        """Max input tokens the underlying model accepts."""
+        return 16384 if self.model_key == "led" else 1024
+
+    def _build_gen_kwargs(
         self,
-        text: str,
-        max_length: Optional[int] = None,
-        min_length: Optional[int] = None
-    ) -> str:
+        inputs: Any,
+        max_length: int,
+        min_length: int,
+    ) -> Dict[str, Any]:
+        """Build generation kwargs, with model-specific tweaks.
+
+        Hyperparameters are tuned for *legal* text which is naturally
+        repetitive (party names, section references, etc.).
+        Aggressive repetition penalties cause entropy collapse →
+        gibberish like "tchaffchaffchaffr".
         """
-        Summarize a single text.
-        
-        Args:
-            text: Input text to summarize
-            max_length: Override max summary length
-            min_length: Override min summary length
-            
-        Returns:
-            Summary string
-        """
-        if not text or not text.strip():
-            return ""
-        
-        max_len = max_length or self.max_length
-        min_len = min_length or self.min_length
-        
-        # Tokenize
+        gen_kwargs: Dict[str, Any] = dict(
+            max_new_tokens=max_length,
+            min_new_tokens=max(1, min(min_length, max_length // 2)),
+            num_beams=4,
+            length_penalty=1.0,           # ↑ from 0.8 — finish thoughts, don't cut off
+            no_repeat_ngram_size=2,       # ↓ from 3 — legal text repeats legitimately
+            repetition_penalty=1.1,       # ↓ from 1.2 — less aggressive for legal prose
+            do_sample=False,
+            early_stopping=True,
+        )
+        # LED-specific: set global_attention on the metadata prefix
+        # (first 64 tokens) so the model grounds on case/court/acts.
+        if self.model_key == "led":
+            seq_len = inputs["input_ids"].shape[1]
+            global_attn = torch.zeros_like(inputs["input_ids"])
+            # Attend globally to first 64 tokens (prefix) + last 32 (verdict)
+            global_attn[:, :min(64, seq_len)] = 1
+            global_attn[:, max(0, seq_len - 32):] = 1
+            gen_kwargs["global_attention_mask"] = global_attn
+        return gen_kwargs
+
+    def _generate_once(self, text: str, max_length: int, min_length: int) -> str:
+        """Single-pass generation (no overflow handling)."""
+        input_max = self._get_input_max()
         inputs = self.tokenizer(
             text,
-            max_length=1024,  # Input max length
+            max_length=input_max,
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
         ).to(self.device)
-        
-        # Generate summary with anti-repetition controls
+
+        gen_kwargs = self._build_gen_kwargs(inputs, max_length, min_length)
+
         with torch.no_grad():
             summary_ids = self.model.generate(
                 inputs["input_ids"],
-                max_length=max_len,
-                min_length=min_len,
-                length_penalty=2.0,
-                num_beams=4,
-                no_repeat_ngram_size=2,  # Prevent 3-gram repetition
-                repetition_penalty=1.5,   # Penalize repeated tokens
-                early_stopping=True
+                attention_mask=inputs.get("attention_mask"),
+                **gen_kwargs,
             )
-        
-        # Decode
-        summary = self.tokenizer.decode(
+        raw = self.tokenizer.decode(
             summary_ids[0],
             skip_special_tokens=True,
-            clean_up_tokenization_spaces=True
-        )
-        
-        return summary.strip()
-    
-    def summarize_chunks(
+            clean_up_tokenization_spaces=True,
+        ).strip()
+        return _clean_decode_artifacts(raw)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def summarize_text(
         self,
-        chunks: List[Any],
-        max_length: Optional[int] = None,
-        min_length: Optional[int] = None
-    ) -> List[str]:
-        """
-        Summarize multiple chunks (first pass).
-        
-        Args:
-            chunks: List of Chunk objects
-            max_length: Override max summary length per chunk
-            min_length: Override min summary length per chunk
-            
-        Returns:
-            List of chunk summaries
-        """
-        if not chunks:
-            return []
-        
-        logger.info(f"Summarizing {len(chunks)} chunks...")
-        
-        # Extract text from chunks
-        texts = [
-            chunk.text if hasattr(chunk, 'text') else str(chunk)
-            for chunk in chunks
-        ]
-        
-        # Batch processing
-        summaries = []
-        max_len = max_length or (self.max_length // 2)  # Shorter for chunk summaries
-        min_len = min_length or (self.min_length // 2)
-        
-        for i in range(0, len(texts), self.batch_size):
-            batch = texts[i:i + self.batch_size]
-            logger.debug(f"Processing batch {i//self.batch_size + 1}/{(len(texts)-1)//self.batch_size + 1}")
-            
-            for text in batch:
-                summary = self.summarize_text(text, max_len, min_len)
-                summaries.append(summary)
-        
-        logger.info(f"✓ Generated {len(summaries)} chunk summaries")
-        return summaries
-    
-    def hierarchical_summary(
-        self,
-        chunks: List[Any],
-        final_max_length: Optional[int] = None,
-        final_min_length: Optional[int] = None
+        text: str,
+        max_length: int = 350,
+        min_length: int = 100,
+        grounding: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
-        Generate hierarchical summary (two-pass).
-        
-        Pass 1: Summarize each chunk
-        Pass 2: Summarize the chunk summaries into final document summary
-        
+        Generate an abstractive summary of *text*.
+
+        If the text exceeds the model's token budget, automatically
+        switches to **hierarchical mode**: split → summarize each →
+        merge → re-summarize.
+
         Args:
-            chunks: List of selected Chunk objects
-            final_max_length: Max length for final summary
-            final_min_length: Min length for final summary
-            
+            text:       Input text (concatenated ranked sentences).
+            max_length: Maximum output length in tokens.
+            min_length: Minimum output length in tokens.
+            grounding:  Optional metadata dict for grounding prefix.
+
         Returns:
-            Final document summary
+            Summary string.
         """
-        if not chunks:
+        if not text or not text.strip():
             return ""
-        
-        if len(chunks) == 1:
-            # Single chunk: just summarize it directly
-            logger.info("Single chunk, direct summarization")
-            return self.summarize_text(
-                chunks[0].text if hasattr(chunks[0], 'text') else str(chunks[0]),
-                final_max_length,
-                final_min_length
+
+        # Prepend lightweight metadata prefix (not a verbose instruction)
+        prefix = _build_metadata_prefix(grounding)
+        full_text = prefix + text
+
+        # Check whether the input fits the model's context window
+        input_max = self._get_input_max()
+        token_count = len(self.tokenizer.encode(full_text, add_special_tokens=False))
+
+        if token_count <= input_max:
+            # --- Single-pass: fits within context window ---
+            summary = self._generate_once(full_text, max_length, min_length)
+        else:
+            # --- Hierarchical mode: split → summarize → merge → re-summarize ---
+            logger.info(
+                f"Input ({token_count} tokens) exceeds {self.model_key} limit "
+                f"({input_max} tokens). Switching to hierarchical mode."
             )
-        
-        logger.info(f"Starting hierarchical summarization of {len(chunks)} chunks...")
-        
-        # Pass 1: Chunk-level summaries
-        chunk_summaries = self.summarize_chunks(chunks)
-        
-        # Pass 2: Combine and summarize chunk summaries
-        combined = "\n\n".join(chunk_summaries)
-        logger.info(f"Combined chunk summaries: {len(combined)} chars")
-        
-        final_max = final_max_length or self.max_length
-        final_min = final_min_length or self.min_length
-        
-        logger.info("Generating final document summary...")
-        final_summary = self.summarize_text(combined, final_max, final_min)
-        
-        logger.info(f"✓ Final summary: {len(final_summary)} chars")
-        return final_summary
-    
-    def generate_structured_summary(
+            summary = self._hierarchical_summarize(
+                text, prefix, max_length, min_length
+            )
+
+        if grounding:
+            summary = validate_and_clean_summary(summary, grounding)
+        return summary
+
+    def _hierarchical_summarize(
         self,
-        chunks: List[Any],
-        include_chunk_summaries: bool = False
+        text: str,
+        prefix: str,
+        max_length: int,
+        min_length: int,
+    ) -> str:
+        """
+        Hierarchical summarization for texts that exceed the model's
+        token budget.
+
+        Strategy:
+          1. Split text into groups of ~500 words (safe for both LED/Pegasus)
+          2. Summarize each group independently
+          3. Concatenate the group summaries
+          4. Run a final summarization pass on the merged text
+        """
+        input_max = self._get_input_max()
+        # Reserve tokens for the prefix
+        prefix_tokens = len(self.tokenizer.encode(prefix, add_special_tokens=False))
+        budget_per_group = input_max - prefix_tokens - 32  # 32-token safety margin
+
+        # Split text into sentences, then pack into groups within budget
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        groups: List[str] = []
+        current_group: List[str] = []
+        current_tokens = 0
+
+        for sent in sentences:
+            sent_tokens = len(self.tokenizer.encode(sent, add_special_tokens=False))
+            if current_tokens + sent_tokens > budget_per_group and current_group:
+                groups.append(" ".join(current_group))
+                current_group = [sent]
+                current_tokens = sent_tokens
+            else:
+                current_group.append(sent)
+                current_tokens += sent_tokens
+        if current_group:
+            groups.append(" ".join(current_group))
+
+        logger.info(f"Hierarchical mode: splitting into {len(groups)} groups")
+
+        # Summarize each group — shorter target, proportional to group count
+        per_group_max = max(80, max_length // len(groups))
+        per_group_min = max(30, min_length // len(groups))
+        group_summaries: List[str] = []
+
+        for i, group_text in enumerate(groups, 1):
+            logger.info(f"  Summarizing group {i}/{len(groups)} "
+                        f"({len(group_text.split())} words)")
+            chunk_input = prefix + group_text
+            s = self._generate_once(chunk_input, per_group_max, per_group_min)
+            if s.strip():
+                group_summaries.append(s.strip())
+
+        if not group_summaries:
+            logger.warning("All group summaries empty — falling back to truncated input")
+            return self._generate_once(prefix + text, max_length, min_length)
+
+        # Merge and do a final pass
+        merged = " ".join(group_summaries)
+        merged_tokens = len(self.tokenizer.encode(prefix + merged, add_special_tokens=False))
+
+        if merged_tokens <= input_max:
+            logger.info(f"Final merge pass ({len(merged.split())} words)")
+            return self._generate_once(prefix + merged, max_length, min_length)
+        else:
+            # Merged text still too long — just return concatenated summaries
+            logger.warning(
+                f"Merged summaries still exceed limit ({merged_tokens} tokens). "
+                f"Returning concatenated group summaries."
+            )
+            return merged
+
+    def summarize_sentences(
+        self,
+        sentences: List[Dict[str, Any]],
+        max_length: int = 350,
+        min_length: int = 100,
+        grounding: Optional[Dict[str, Any]] = None,
     ) -> SummaryResult:
         """
-        Generate structured summary with metadata.
-        
+        Summarise a list of sentence dicts (as returned by ``rank_sentences``).
+
         Args:
-            chunks: List of Chunk objects 
-            include_chunk_summaries: Whether to include intermediate summaries
-            
+            sentences: List of ``{"text": str, ...}`` dicts.
+            max_length: Max summary tokens.
+            min_length: Min summary tokens.
+
         Returns:
-            SummaryResult with summary and metadata
+            :class:`SummaryResult`.
         """
-        if not chunks:
-            return SummaryResult(
-                summary="",
-                chunk_summaries=[],
-                model_name=self.model_name,
-                input_length=0,
-                output_length=0
-            )
-        
-        # Calculate input length
-        input_text = "\n".join(
-            chunk.text if hasattr(chunk, 'text') else str(chunk)
-            for chunk in chunks
-        )
-        input_length = len(input_text)
-        
-        # Generate summaries
-        if include_chunk_summaries:
-            chunk_summaries = self.summarize_chunks(chunks)
-            combined = "\n\n".join(chunk_summaries)
-            final_summary = self.summarize_text(combined)
-        else:
-            chunk_summaries = None
-            final_summary = self.hierarchical_summary(chunks)
-        
+        combined = " ".join(s["text"] for s in sentences)
+        input_wc = len(combined.split())
+
+        summary = self.summarize_text(combined, max_length, min_length, grounding=grounding)
+
         return SummaryResult(
-            summary=final_summary,
-            chunk_summaries=chunk_summaries,
-            model_name=self.model_name,
-            input_length=input_length,
-            output_length=len(final_summary)
+            summary=summary,
+            model_used=self.model_key,
+            input_word_count=input_wc,
+            output_word_count=len(summary.split()),
         )
 
 
-# =============================================================================
-# CONVENIENCE FUNCTIONS
-# =============================================================================
-
-_summarizer: Optional[LegalSummarizer] = None
-
-def _get_summarizer() -> LegalSummarizer:
-    """Get or create singleton summarizer instance."""
-    global _summarizer
-    if _summarizer is None:
-        logger.info("Initializing singleton summarizer...")
-        _summarizer = LegalSummarizer()
-    return _summarizer
-
-
+# ---------------------------------------------------------------------------
+# Convenience function
+# ---------------------------------------------------------------------------
 def summarize_document(
-    chunks: List[Any],
-    max_length: int = 512,
-    min_length: int = 100
-) -> str:
+    sentences: List[Dict[str, Any]],
+    config: Any,
+    grounding: Optional[Dict[str, Any]] = None,
+) -> SummaryResult:
     """
-    Summarize a document from selected chunks.
-    
-    Convenience function for quick summarization.
-    
+    High-level convenience: load model per *config* and summarise *sentences*.
+
     Args:
-        chunks: List of selected Chunk objects
-        max_length: Maximum summary length
-        min_length: Minimum summary length
-        
+        sentences: Pre-ranked sentence dicts from ``retriever.rank_sentences``.
+        config:    A ``SummaryConfig`` instance (from ``config.py``).
+
     Returns:
-        Summary string
-    
-    Example:
-        >>> from pipeline import chunk_text, LegalEmbedder, select_chunks
-        >>> from pipeline.summarizer import summarize_document
-        >>> 
-        >>> chunks = chunk_text(legal_text)
-        >>> embedder = LegalEmbedder()
-        >>> result = embedder.embed_chunks(chunks)
-        >>> selected = select_chunks(chunks, result.embeddings, top_n=10)
-        >>> summary = summarize_document(selected)
+        :class:`SummaryResult`.
     """
-    summarizer = _get_summarizer()
-    return summarizer.hierarchical_summary(
-        chunks,
-        final_max_length=max_length,
-        final_min_length=min_length
+    summarizer = LegalSummarizer(model_key=config.model)
+    return summarizer.summarize_sentences(
+        sentences,
+        max_length=config.max_length,
+        min_length=config.min_length,
+        grounding=grounding,
     )
 
 
-def summarize_chunks(chunks: List[Any]) -> List[str]:
+def _build_metadata_prefix(grounding: Optional[Dict[str, Any]]) -> str:
     """
-    Get individual chunk summaries.
-    
-    Useful for debugging or when you want fine-grained control.
-    
-    Args:
-        chunks: List of Chunk objects
-        
-    Returns:
-        List of summary strings
+    Build a lightweight metadata prefix for seq2seq models.
+
+    These models (LED, Pegasus) are NOT instruction-tuned — they were
+    trained on ``document → summary`` pairs.  A verbose "You are a legal
+    expert…" prompt wastes tokens and can confuse the decoder.
+
+    Instead, we inject only structured metadata tags that the model can
+    use as anchoring context (case name, court, relevant Acts).
     """
-    return _get_summarizer().summarize_chunks(chunks)
+    if not grounding:
+        return ""
+
+    parts: List[str] = []
+
+    # Case title / header
+    header = grounding.get("repeated_header", "") or ""
+    if header.strip():
+        parts.append(f"[CASE: {header.strip()[:120]}]")
+
+    # Court name (from metadata text, first line often has it)
+    meta_text = grounding.get("metadata_text", "") or ""
+    if meta_text.strip():
+        first_line = meta_text.strip().split("\n")[0].strip()[:100]
+        if first_line:
+            parts.append(f"[COURT: {first_line}]")
+
+    # Citations / Acts
+    citations: List[str] = []
+    for k in ("allowed_citations", "citations", "unique_citations"):
+        v = grounding.get(k)
+        if isinstance(v, list):
+            citations.extend([str(x).strip() for x in v if str(x).strip()])
+    citations = list(dict.fromkeys(citations))[:10]  # de-dupe, cap at 10
+    if citations:
+        parts.append(f"[ACTS: {'; '.join(citations)}]")
+
+    if not parts:
+        return ""
+    return " ".join(parts) + " "
+
+
+def _clean_decode_artifacts(text: str) -> str:
+    """
+    Remove common decoding artifacts from model output:
+    - Broken bracket sequences: [[[[1], [[[2B], etc.
+    - Repeated nonsense fragments (entropy collapse)
+    - Partial words / trailing gibberish
+    """
+    if not text:
+        return text
+
+    # 1. Strip broken bracket patterns: [[[[, ]]]], [[[1B], etc.
+    text = re.sub(r'\[{2,}[^\]]*\]{0,}', '', text)
+    text = re.sub(r'\]{2,}', '', text)
+    text = re.sub(r'\[\d+[A-Za-z]*\]', '', text)  # [1], [2B], etc.
+
+    # 2. Detect trailing gibberish — look for the last well-formed sentence
+    #    A well-formed sentence ends with . ! or ?
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    if len(sentences) > 1:
+        # Check if the last "sentence" is gibberish (very low alpha ratio)
+        last = sentences[-1]
+        alpha_chars = sum(1 for c in last if c.isalpha())
+        total_chars = len(last)
+        if total_chars > 20 and (alpha_chars / max(total_chars, 1)) < 0.5:
+            # Last chunk is likely gibberish — drop it
+            sentences = sentences[:-1]
+            text = ' '.join(sentences)
+
+    # 3. Clean up extra whitespace
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+
+    return text
+
+
+def validate_and_clean_summary(summary: str, grounding: Dict[str, Any]) -> str:
+    """
+    Lightweight "anchor" step: drop obviously hallucinated sentences
+    (foreign jurisdictions, finance regulators, impossible courts, etc.)
+    and drop statute references that are not present in the extracted citations.
+    """
+    s = (summary or "").strip()
+    if not s:
+        return s
+
+    allowed_text_parts: List[str] = []
+    for k in ("metadata_text", "metadata", "repeated_header"):
+        v = grounding.get(k)
+        if isinstance(v, str):
+            allowed_text_parts.append(v)
+    for k in ("allowed_citations", "citations", "unique_citations"):
+        v = grounding.get(k)
+        if isinstance(v, list):
+            allowed_text_parts.extend([str(x) for x in v])
+    allowed_text = " ".join(allowed_text_parts)
+
+    # Expand list of drift markers seen in this project
+    suspicious_patterns = [
+        r"\bUnited States\b",
+        r"\bU\.S\.\b",
+        r"\bSecurities Exchange Act\b",
+        r"\bRule\s*10b-5\b",
+        r"\bCalifornia\b",
+        r"\bNew York\b",
+        r"\bFederal Court\b",
+        r"\bSEBI\b",
+        r"\bSecurities and Exchange Board of India\b",
+        r"\bBombay High Court\b",
+        r"\bCalcutta High Court\b",
+        r"\bHigh Court of West Bengal\b",
+    ]
+    suspicious_regexes = [re.compile(p, re.IGNORECASE) for p in suspicious_patterns]
+
+    # Pre-clean: strip bracket artifacts from model output
+    s = _clean_decode_artifacts(s)
+
+    # Statute sanity check: if we have extracted "Section ..." strings, enforce them.
+    allowed_sections = [
+        str(x).lower() for x in grounding.get("allowed_sections", []) or []
+    ]
+    if not allowed_sections:
+        cites = grounding.get("allowed_citations") or grounding.get("unique_citations") or []
+        if isinstance(cites, list):
+            allowed_sections = [c.lower() for c in cites if str(c).lower().startswith("section ")]
+
+    section_regex = re.compile(r"\b[Ss]ection\s+\d+[A-Za-z]*(?:\s*\(\d+\))?")
+
+    raw_sentences = re.split(r"(?<=[.!?])\s+", s)
+    kept: List[str] = []
+    for sent in raw_sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+
+        # Drop if it contains a known drift marker not present in metadata/citations
+        drop = False
+        for rgx in suspicious_regexes:
+            m = rgx.search(sent)
+            if m and m.group(0).lower() not in allowed_text.lower():
+                drop = True
+                break
+        if drop:
+            continue
+
+        # Drop if it mentions a Section not in extracted citations (when available)
+        if allowed_sections:
+            for match in section_regex.findall(sent):
+                norm = match.lower()
+                if not any(norm in a for a in allowed_sections):
+                    drop = True
+                    break
+        if drop:
+            continue
+
+        kept.append(sent)
+
+    return " ".join(kept) if kept else s

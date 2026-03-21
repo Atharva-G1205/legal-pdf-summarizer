@@ -6,8 +6,9 @@ PDF → Extract → Preprocess → Chunk → Embed → Retrieve → Summarize
 
 Usage:
     from pipeline import (
-        PDFLoader, preprocess, chunk_text, 
-        LegalEmbedder, select_chunks, summarize_document
+        PDFLoader, preprocess, chunk_text,
+        LegalEmbedder, select_chunks, rank_sentences,
+        LegalSummarizer, summarize_document,
     )
 """
 
@@ -17,7 +18,12 @@ from pipeline.preprocessor import *
 from pipeline.chunker import *
 from pipeline.embedder import *
 from pipeline.retriever import *
-from pipeline.summarizer import *
+
+# Summarizer may not be available yet (e.g. during extractive-only tests)
+try:
+    from pipeline.summarizer import *
+except ImportError:
+    pass
 
 # Alias for CLI entry point
 from pipeline.preprocessor import main as preprocess_main
@@ -28,6 +34,7 @@ __all__ = [
     'PDFLoader',
     # Preprocessor
     'TextPreprocessor', 'PageType',
+    'SentenceSegmenter', 'TokenLimitHandler',
     'preprocess', 'preprocess_file', 'preprocess_directory',
     'get_summarization_text', 'get_sections', 'get_clean_text',
     'get_metadata', 'get_citations', 'preprocess_main',
@@ -36,7 +43,8 @@ __all__ = [
     # Embedder
     'LegalEmbedder', 'EmbeddingResult', 'embed_text', 'embed_chunks',
     # Retriever
-    'LegalRetriever', 'select_chunks', 'LEGAL_INTENT_QUERIES',
+    'LegalRetriever', 'select_chunks', 'rank_sentences',
+    'LEGAL_INTENT_QUERIES', 'SECTION_BOOSTS',
     # Summarizer
-    'LegalSummarizer', 'summarize_document', 'summarize_chunks',
+    'LegalSummarizer', 'SummaryResult', 'summarize_document',
 ]

@@ -16,6 +16,7 @@ class SummaryLevel(Enum):
     EXECUTIVE = 1
     DETAILED = 2
     TECHNICAL = 3
+    EXTRACTIVE = 4
 
 
 @dataclass(frozen=True)
@@ -25,8 +26,9 @@ class SummaryConfig:
     Attributes:
         name: Human-readable name
         emoji: Display emoji
-        model: HuggingFace model name
-        top_n: Number of chunks to retrieve
+        model: Model key ("led" or "pegasus")
+        backend: "local" or "online"
+        top_n: Number of sentences to retrieve
         max_length: Maximum summary length in tokens
         min_length: Minimum summary length in tokens
         description: User-facing description
@@ -40,6 +42,7 @@ class SummaryConfig:
     max_length: int
     min_length: int
     description: str
+    backend: str = 'local'
     chunk_words: int = 400
     chunk_overlap: int = 50
 
@@ -54,12 +57,11 @@ class SummaryConfig:
 # MODEL CONFIGURATIONS
 # =============================================================================
 
-# Available models (in order of preference for each use case)
+# Model keys correspond to LegalSummarizer.LOCAL_MODELS entries.
+# These are locally stored fine-tuned models under <project>/models/.
 MODELS = {
-    'fast': 'facebook/bart-large-cnn',         # Fast, good quality
-    'legal': 'nsi319/legal-pegasus',           # Legal-specific
-    'long_context': 'allenai/led-large-16384', # Long documents (16K tokens)
-    'instruction': 'google/flan-t5-large',     # Instruction-tuned
+    'led': 'led',            # Legal-LED-base-16384  (lighter, 16K input)
+    'pegasus': 'pegasus',    # Legal-Pegasus          (larger, higher quality)
 }
 
 
@@ -71,37 +73,47 @@ SUMMARY_CONFIGS: Dict[SummaryLevel, SummaryConfig] = {
     SummaryLevel.EXECUTIVE: SummaryConfig(
         name='Executive',
         emoji='📋',
-        model=MODELS['fast'],
-        top_n=10,
-        max_length=300,
+        model=MODELS['led'],           # LED: fast, handles long input
+        top_n=20,                       # ~700 words of ground truth
+        max_length=350,
         min_length=150,
         description='Concise overview for decision-makers (~150 words)',
         chunk_words=350,
         chunk_overlap=40,
     ),
-    
+
     SummaryLevel.DETAILED: SummaryConfig(
         name='Detailed',
         emoji='📄',
-        model=MODELS['legal'],
-        top_n=20,
-        max_length=768,
-        min_length=400,
+        model=MODELS['led'],            # LED: 16K context avoids hierarchical gibberish
+        top_n=35,                       # richer ground truth for reasoning/order
+        max_length=800,
+        min_length=360,
         description='Comprehensive summary for lawyers (~400 words)',
         chunk_words=400,
         chunk_overlap=50,
     ),
-    
+
     SummaryLevel.TECHNICAL: SummaryConfig(
         name='Technical',
         emoji='🔬',
-        model=MODELS['legal'],
-        top_n=28,
-        max_length=1280,
+        model=MODELS['led'],            # LED: 16K context avoids hierarchical gibberish
+        top_n=45,                       # long-form analysis with ample context
+        max_length=1200,
         min_length=600,
         description='In-depth analysis for researchers (~600 words)',
         chunk_words=500,
         chunk_overlap=75,
+    ),
+
+    SummaryLevel.EXTRACTIVE: SummaryConfig(
+        name='Extractive',
+        emoji='📌',
+        model='none',                  # no abstractive model — ranked sentences only
+        top_n=25,                       # top 25 sentences ≈ 400 words
+        max_length=0,
+        min_length=0,
+        description='Top-ranked sentences, no generation (~400 words)',
     ),
 }
 
@@ -137,7 +149,7 @@ def get_config_by_number(choice: int) -> SummaryConfig:
         level = SummaryLevel(choice)
         return SUMMARY_CONFIGS[level]
     except ValueError:
-        raise ValueError(f"Invalid choice: {choice}. Must be 1, 2, or 3.")
+        raise ValueError(f"Invalid choice: {choice}. Must be 1, 2, 3, or 4.")
 
 
 # CLI display strings
@@ -152,4 +164,7 @@ Choose summary type:
 
   3. 🔬 TECHNICAL   - In-depth analysis for researchers
                       (~600 words, full legal analysis)
+
+  4. 📌 EXTRACTIVE  - Top-ranked sentences only, no generation
+                      (~400 words, zero hallucination)
 """

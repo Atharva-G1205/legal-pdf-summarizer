@@ -49,6 +49,8 @@ PROCESSED_DIR: Path = Path(__file__).resolve().parent.parent / "data" / "process
 __all__ = [
     'TextPreprocessor',
     'PageType',
+    'SentenceSegmenter',
+    'TokenLimitHandler',
     'preprocess',
     'preprocess_file',
     'preprocess_directory',
@@ -282,17 +284,141 @@ class CitationExtractor:
         return unique
 
 
+class SentenceSegmenter:
+    """
+    Splits section text into individual sentences.
+
+    Uses a two-pass approach:
+      1. Split on sentence-ending punctuation followed by whitespace
+         and an uppercase letter / digit / opening bracket.
+      2. Re-merge any split caused by a common legal abbreviation
+         (v., vs., No., Sec., etc.).
+    """
+
+    # Abbreviations that should NOT end a sentence (lowercased)
+    _ABBREVS: Set[str] = {
+        'v', 'vs', 'no', 'nos', 'art', 'sec', 'hon', 'shri', 'smt',
+        'mr', 'mrs', 'dr', 'prof', 'sr', 'jr', 'ltd', 'pvt', 'govt',
+        'assn', 'corp', 'inc', 'para', 'paras', 'cl', 'sub',
+        'i.e', 'e.g', 'viz', 'ibid', 'supra', 'etc',
+    }
+
+    # Simple sentence boundary: punctuation, whitespace, then uppercase / digit / bracket
+    _SPLIT_RE = re.compile(
+        r'(?<=[.!?])\s+(?=[A-Z0-9\(\["])',
+        re.MULTILINE,
+    )
+
+    def _last_word(self, text: str) -> str:
+        """Return the last whitespace-delimited token, stripped of trailing punctuation."""
+        token = text.rstrip().rsplit(None, 1)[-1] if text.strip() else ''
+        return token.rstrip('.!?').lower()
+
+    def segment(self, text: str, start_id: int = 1) -> List[Dict[str, Any]]:
+        """
+        Split *text* into sentences and return a list of
+        ``{"id": int, "text": str}`` dicts.
+
+        Sentences shorter than 6 characters (e.g. stray punctuation)
+        are silently dropped.
+        """
+        # Pass 1: naive split
+        raw_parts = self._SPLIT_RE.split(text)
+
+        # Pass 2: re-merge where the split was caused by an abbreviation
+        merged: List[str] = []
+        for part in raw_parts:
+            if merged and self._last_word(merged[-1]) in self._ABBREVS:
+                merged[-1] = merged[-1] + ' ' + part
+            else:
+                merged.append(part)
+
+        # Build output
+        sentences: List[Dict[str, Any]] = []
+        sid = start_id
+        for fragment in merged:
+            fragment = fragment.strip()
+            if len(fragment) > 5:  # skip trivial fragments
+                sentences.append({'id': sid, 'text': fragment})
+                sid += 1
+        return sentences
+
+
+class TokenLimitHandler:
+    """
+    Ensures no sentence exceeds InLegalBERT's max sequence length.
+
+    If a sentence is longer than *max_tokens* (default 512) it is split
+    into overlapping sub-sentences using a word-level sliding window.
+
+    The handler deliberately works at the **word** level so it does not
+    require the ``transformers`` tokenizer at preprocessing time —
+    keeping the step fast and dependency-light.  A conservative
+    words-to-tokens ratio of **1 word ≈ 1.3 sub-word tokens** is used;
+    this means the effective word limit is ``max_tokens / 1.3 ≈ 393``
+    which the default ``window_words=400`` tracks closely.
+    """
+
+    def __init__(
+        self,
+        max_tokens: int = 512,
+        window_words: int = 400,
+        overlap_words: int = 50,
+    ):
+        self.max_tokens = max_tokens
+        self.window_words = window_words
+        self.overlap_words = overlap_words
+        # Conservative ratio — 1 word ≈ 1.3 BPE tokens for legal English
+        self._word_limit = int(max_tokens / 1.3)
+
+    def _exceeds_limit(self, text: str) -> bool:
+        """Return True when *text* likely exceeds the token budget."""
+        return len(text.split()) > self._word_limit
+
+    def enforce(
+        self, sentences: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Walk through *sentences* and split any that exceed the token
+        limit.  Re-assigns sequential ``id`` values.
+        """
+        out: List[Dict[str, Any]] = []
+        for sent in sentences:
+            if not self._exceeds_limit(sent['text']):
+                out.append(sent)
+                continue
+
+            # Sliding-window split
+            words = sent['text'].split()
+            start = 0
+            while start < len(words):
+                end = min(start + self.window_words, len(words))
+                chunk = ' '.join(words[start:end])
+                out.append({'id': 0, 'text': chunk})  # id fixed below
+                if end >= len(words):
+                    break
+                start += self.window_words - self.overlap_words
+
+        # Re-assign contiguous ids
+        for idx, item in enumerate(out, start=1):
+            item['id'] = idx
+
+        return out
+
+
 class TextPreprocessor:
     """
     Main preprocessor for legal document text.
     Coordinates all cleaning, classification, and extraction operations.
     """
-    
+
     def __init__(self):
         self.pattern_matcher = PatternMatcher()
         self.classifier = SectionClassifier()
         self.cleaner = TextCleaner(self.pattern_matcher)
         self.citation_extractor = CitationExtractor(self.pattern_matcher)
+        self.segmenter = SentenceSegmenter()
+        self.token_handler = TokenLimitHandler()
     
     def classify_pages(self, pages: List[Dict]) -> List[Dict]:
         """Classify all pages with their types."""
@@ -417,7 +543,26 @@ class TextPreprocessor:
         
         # Merge into sections
         sections = self.merge_sections(classified_pages)
-        
+
+        # ── Optimization 1: sentence-level granularity ──────────────
+        # Split each section's text block into individual sentences so
+        # the extractive model can rank specific sentences rather than
+        # being forced to take the whole block.
+        total_sentences = 0
+        for section_name, section_data in sections.items():
+            raw_sentences = self.segmenter.segment(section_data['text'])
+            # ── Optimization 2: token-limit enforcement ─────────────
+            # Ensure no sentence exceeds InLegalBERT's 512-token limit
+            # by applying a sliding-window split where necessary.
+            safe_sentences = self.token_handler.enforce(raw_sentences)
+            section_data['sentences'] = safe_sentences
+            total_sentences += len(safe_sentences)
+
+        logger.info(
+            f"Segmented sections into {total_sentences} sentences "
+            f"(token limit: {self.token_handler.max_tokens})"
+        )
+
         # Generate summarization-ready text
         summarization_text = self.generate_summarization_text(sections)
         
@@ -434,7 +579,8 @@ class TextPreprocessor:
             'sections': sections,
             'summarization_input': {
                 'text': summarization_text,
-                'word_count': len(summarization_text.split())
+                'word_count': len(summarization_text.split()),
+                'total_sentences': total_sentences,
             },
             'metadata': {
                 'text': metadata_text,

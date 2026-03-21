@@ -10,3 +10,5 @@ __pycache__
 models/
 *.md
 .python-version
+.vscode
+.pytest_cache

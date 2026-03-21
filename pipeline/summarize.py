@@ -1,310 +1,201 @@
 """
-Multi-Level Legal PDF Summarizer
-=================================
+Multi-Level Legal PDF Summarizer — Orchestrator
+=================================================
 
-Generates executive, detailed, or technical summaries based on user choice.
+End-to-end pipeline that:
+  1. Loads a PDF and preprocesses it
+  2. Flattens sentences from classified sections
+  3. Ranks sentences with InLegalBERT (extractive)
+  4. Generates an abstractive summary with Legal-LED / Legal-Pegasus
 
 Usage:
-    python summarize.py                    # Interactive mode
-    python summarize.py --help            # Show help
-
-Configuration:
-    Edit config.py to customize models, lengths, and chunk settings.
+    python pipeline/summarize.py                 # Interactive mode
+    python pipeline/summarize.py path/to/case.pdf   # Direct mode
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, Dict, List
 
-from config import (
-    SummaryLevel,
+# Allow running from project root: ``python pipeline/summarize.py``
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from pipeline.config import (
     SummaryConfig,
     get_config_by_number,
     MENU_OPTIONS,
 )
-from pipeline import (
-    PDFLoader,
-    preprocess,
-    get_summarization_text,
-    chunk_text,
-    LegalEmbedder,
-    select_chunks,
-)
-from pipeline.summarizer import LegalSummarizer
-
-if TYPE_CHECKING:
-    from pipeline.chunker import Chunk
-    from pipeline.embedder import EmbeddingResult
+from pipeline.pdf_loader import PDFLoader
+from pipeline.preprocessor import TextPreprocessor
+from pipeline.retriever import rank_sentences
+from pipeline.summarizer import LegalSummarizer, SummaryResult
 
 
-# =============================================================================
-# DISPLAY UTILITIES
-# =============================================================================
+# ============================================================================
+# DISPLAY HELPERS
+# ============================================================================
 
-def print_header(title: str) -> None:
-    """Print a formatted section header."""
+def _header(title: str) -> None:
     print(f"\n{'=' * 70}")
     print(f"  {title}")
-    print('=' * 70)
+    print("=" * 70)
 
 
-def print_step(icon: str, message: str, detail: str = '') -> None:
-    """Print a pipeline step with optional detail."""
-    print(f"\n{icon}  {message}")
+def _step(icon: str, msg: str, detail: str = "") -> None:
+    print(f"\n{icon}  {msg}")
     if detail:
         print(f"   {detail}")
 
 
-def print_success(message: str) -> None:
-    """Print a success message."""
-    print(f"   ✓ {message}")
+def _ok(msg: str) -> None:
+    print(f"   ✓ {msg}")
 
 
-# =============================================================================
+# ============================================================================
 # USER INTERACTION
-# =============================================================================
+# ============================================================================
 
 def select_summary_type() -> SummaryConfig:
-    """Prompt user to select summary type.
-    
-    Returns:
-        Selected SummaryConfig
-    """
-    print_header("Legal PDF Summarizer - Multi-Level Summary")
+    """Prompt the user to choose a summary level."""
+    _header("Legal PDF Summarizer — Multi-Level Summary")
     print(MENU_OPTIONS)
-    
     while True:
         try:
-            choice = input("Enter choice (1/2/3): ").strip()
+            choice = input("Enter choice (1/2/3/4): ").strip()
             return get_config_by_number(int(choice))
         except (ValueError, KeyError):
-            print("❌ Invalid choice. Please enter 1, 2, or 3.")
+            print("❌ Invalid choice. Please enter 1, 2, 3, or 4.")
 
 
 def get_pdf_path() -> Path:
-    """Prompt user for PDF path and validate.
-    
-    Returns:
-        Validated Path object
-        
-    Raises:
-        FileNotFoundError: If file doesn't exist
-        ValueError: If not a PDF file
-    """
-    path_str = input("Enter PDF path: ").strip().strip('"\'')
+    """Prompt for and validate a PDF path."""
+    path_str = input("Enter PDF path: ").strip().strip("\"'")
     path = Path(path_str).expanduser().resolve()
-    
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
-    
-    if path.suffix.lower() != '.pdf':
+    if path.suffix.lower() != ".pdf":
         raise ValueError(f"Not a PDF file: {path}")
-    
     return path
 
 
-# =============================================================================
+# ============================================================================
 # PIPELINE STEPS
-# =============================================================================
+# ============================================================================
 
-def load_document(pdf_path: Path) -> tuple[dict, str]:
-    """Load and preprocess PDF document.
-    
-    Args:
-        pdf_path: Path to PDF file
-        
-    Returns:
-        Tuple of (processed_doc, text_content)
+def flatten_sentences(processed_doc: dict) -> List[Dict[str, Any]]:
     """
-    print_step("📂", "Loading PDF...")
-    loader = PDFLoader()
-    doc = loader.load_pdf(pdf_path)
-    
-    print_step("📝", "Preprocessing document...")
-    processed = preprocess(doc)
-    text = get_summarization_text(doc)
-    print_success(f"Extracted {len(text):,} characters")
-    
-    return processed, text
-
-
-def create_chunks(text: str, config: SummaryConfig) -> list:
-    """Chunk text according to config settings.
-    
-    Args:
-        text: Document text
-        config: Summary configuration
-        
-    Returns:
-        List of Chunk objects
+    Flatten per-section sentence lists, tagging each with its section name.
     """
-    print_step("✂️", "Chunking document...")
-    chunks = chunk_text(
-        text,
-        target_words=config.chunk_words,
-        overlap_words=config.chunk_overlap
-    )
-    print_success(f"Created {len(chunks)} chunks")
-    return chunks
+    out: list[dict] = []
+    for sec in ["headnote", "facts", "issues", "arguments", "reasoning", "order"]:
+        section = processed_doc.get("sections", {}).get(sec)
+        if section and "sentences" in section:
+            for sent in section["sentences"]:
+                out.append({**sent, "section": sec})
+    return out
 
-
-def embed_and_retrieve(
-    chunks: list, 
-    config: SummaryConfig
-) -> list:
-    """Generate embeddings and retrieve top chunks.
-    
-    Args:
-        chunks: List of Chunk objects
-        config: Summary configuration
-        
-    Returns:
-        Selected chunks for summarization
-    """
-    print_step("🧠", "Generating embeddings (InLegalBERT)...")
-    embedder = LegalEmbedder()
-    result = embedder.embed_chunks(chunks)
-    print_success(f"Embeddings: {result.embeddings.shape} on {result.device}")
-    
-    print_step("🎯", f"Selecting top {config.top_n} relevant chunks...")
-    selected = select_chunks(chunks, result.embeddings, top_n=config.top_n)
-    total_words = sum(c.word_count for c in selected)
-    print_success(f"Selected {len(selected)} chunks ({total_words:,} words)")
-    
-    return selected
-
-
-def generate_summary(
-    chunks: list, 
-    config: SummaryConfig
-) -> str:
-    """Generate summary using configured model.
-    
-    Args:
-        chunks: Selected chunks
-        config: Summary configuration
-        
-    Returns:
-        Generated summary text
-    """
-    print_step("🤖", f"Loading {config.name} summarizer...")
-    print(f"   Model: {config.model}")
-    summarizer = LegalSummarizer(model_name=config.model)
-    
-    print_step("📝", f"Generating {config.name} summary...")
-    summary = summarizer.hierarchical_summary(
-        chunks,
-        final_max_length=config.max_length,
-        final_min_length=config.min_length
-    )
-    
-    return summary
-
-
-# =============================================================================
-# OUTPUT & STATS
-# =============================================================================
-
-def display_summary(summary: str, config: SummaryConfig) -> None:
-    """Display the generated summary."""
-    print_header(f"{config.emoji} {config.name.upper()} SUMMARY")
-    print()
-    print(summary)
-    print()
-    print('=' * 70)
-
-
-def display_stats(
-    summary: str,
-    config: SummaryConfig,
-    selected_count: int,
-    total_chunks: int,
-    source_words: int,
-    source_chars: int
-) -> None:
-    """Display summary statistics."""
-    word_count = len(summary.split())
-    compression = (len(summary) / source_chars) * 100 if source_chars else 0
-    
-    print(f"\n📊 Summary Statistics:")
-    print(f"   Type: {config.name}")
-    print(f"   Model: {config.model}")
-    print(f"   Length: {word_count} words ({len(summary)} characters)")
-    print(f"   Source: {selected_count}/{total_chunks} chunks ({source_words:,} words)")
-    print(f"   Compression: {source_chars:,} → {len(summary):,} chars ({compression:.1f}%)")
-    print()
-
-
-# =============================================================================
-# MAIN PIPELINE
-# =============================================================================
 
 def run_pipeline(pdf_path: Path, config: SummaryConfig) -> str:
-    """Run the full summarization pipeline.
-    
-    Args:
-        pdf_path: Path to PDF file
-        config: Summary configuration
-        
-    Returns:
-        Generated summary
     """
-    print_header("Processing PDF")
-    
-    # Step 1: Load & preprocess
-    processed, text = load_document(pdf_path)
-    
-    # Step 2: Chunk
-    chunks = create_chunks(text, config)
-    
-    # Step 3: Embed & retrieve
-    selected = embed_and_retrieve(chunks, config)
-    
-    # Step 4: Generate summary
-    summary = generate_summary(selected, config)
-    
-    # Step 5: Display results
-    display_summary(summary, config)
-    
-    # Step 6: Show stats
-    source_words = sum(c.word_count for c in selected)
-    display_stats(
-        summary=summary,
-        config=config,
-        selected_count=len(selected),
-        total_chunks=len(chunks),
-        source_words=source_words,
-        source_chars=len(text)
-    )
-    
-    return summary
+    Execute the full summarization pipeline and return the summary string.
+    """
 
+    # 1. Load PDF -------------------------------------------------------
+    _step("📂", "Loading PDF…")
+    loader = PDFLoader()
+    raw_doc = loader.load_pdf(pdf_path)
+
+    # 2. Preprocess ------------------------------------------------------
+    _step("📝", "Preprocessing document…")
+    preprocessor = TextPreprocessor()
+    processed = preprocessor.clean_document(raw_doc)
+
+    total_sents = processed.get("summarization_input", {}).get("total_sentences", 0)
+    sections = list(processed.get("sections", {}).keys())
+    _ok(f"Sections: {sections}")
+    _ok(f"Total sentences: {total_sents}")
+
+    # 3. Flatten sentences -----------------------------------------------
+    all_sentences = flatten_sentences(processed)
+    _step("✂️", f"Flattened {len(all_sentences)} sentences from sections")
+
+    if not all_sentences:
+        print("⚠  No sentences found — cannot generate summary.")
+        return ""
+
+    # 4. Rank with InLegalBERT -------------------------------------------
+    _step("🧠", f"Ranking top {config.top_n} sentences (InLegalBERT)…")
+    top_sentences = rank_sentences(all_sentences, top_n=config.top_n)
+    total_words = sum(len(s["text"].split()) for s in top_sentences)
+    _ok(f"Selected {len(top_sentences)} sentences ({total_words:,} words)")
+
+    # 5. Generate summary ------------------------------------------------
+    if config.model == "none":
+        # --- Extractive mode: return ranked sentences as-is ---
+        _step("📌", "Extractive mode — returning top-ranked sentences")
+        lines = [
+            f"{i}. [{s.get('section', '?').upper()}] {s['text']}"
+            for i, s in enumerate(top_sentences, 1)
+        ]
+        return "\n".join(lines)
+
+    # --- Abstractive mode ---
+    _step("🤖", f"Loading {config.name} summarizer (model: {config.model})…")
+    summarizer = LegalSummarizer(model_key=config.model)
+
+    _step("📝", f"Generating {config.name} summary…")
+    grounding = {
+        "metadata_text": processed.get("metadata", {}).get("text", ""),
+        "repeated_header": processed.get("metadata", {}).get("repeated_header", ""),
+        "unique_citations": processed.get("citations", {}).get("unique_citations", []),
+    }
+    result: SummaryResult = summarizer.summarize_sentences(
+        top_sentences,
+        max_length=config.max_length,
+        min_length=config.min_length,
+        grounding=grounding,
+    )
+
+    return result.summary
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main() -> None:
-    """Main entry point for interactive summarization."""
-    # Step 1: Select summary type
-    config = select_summary_type()
-    print(f"\n✓ Selected: {config.emoji} {config.name} Summary")
-    print(f"  {config.description}")
-    
-    # Step 2: Get PDF path
-    pdf_path = get_pdf_path()
-    
-    # Step 3: Run pipeline
-    run_pipeline(pdf_path, config)
+    """Interactive entry point."""
+    try:
+        # If a path was given as CLI arg, use it; otherwise prompt
+        if len(sys.argv) > 1:
+            pdf_path = Path(sys.argv[1]).expanduser().resolve()
+            if not pdf_path.exists():
+                print(f"❌ File not found: {pdf_path}")
+                sys.exit(1)
+        else:
+            pdf_path = get_pdf_path()
+
+        config = select_summary_type()
+
+        summary = run_pipeline(pdf_path, config)
+
+        # Display result
+        _header(f"{config.emoji} {config.name} Summary")
+        print()
+        print(summary)
+        print()
+        print(f"({len(summary.split())} words)")
+
+    except KeyboardInterrupt:
+        print("\n\nCancelled.")
+    except Exception as exc:
+        print(f"\n❌ Error: {exc}")
+        raise
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n❌ Cancelled by user")
-        sys.exit(130)
-    except FileNotFoundError as e:
-        print(f"\n❌ File Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        raise
+    main()

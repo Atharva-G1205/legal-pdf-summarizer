@@ -34,7 +34,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'LegalRetriever',
     'select_chunks',
+    'rank_sentences',
     'LEGAL_INTENT_QUERIES',
+    'SECTION_BOOSTS',
 ]
 
 
@@ -44,7 +46,22 @@ LEGAL_INTENT_QUERIES = {
     'issues': "What are the legal issues and questions for consideration?",
     'arguments': "What arguments and submissions were made by the parties and their counsel?",
     'reasoning': "What is the court's legal analysis, reasoning, and interpretation?",
-    'decision': "What is the final decision, order, and judgment of the court?"
+    'decision': "What is the final decision, order, and judgment of the court?",
+    'temporal': "What are the key dates, timelines, and chronological events in this case?",
+    'expert': "What expert witness testimony, medical opinions, or professional assessments were given?",
+    'standard': "What is the standard of care, duty, or legal test applied by the court?",
+}
+
+
+# Section-priority boosts: ensures critical sections aren't filtered out
+# by centroid averaging.  Values are added to the combined score.
+SECTION_BOOSTS: Dict[str, float] = {
+    'order': 0.25,
+    'judgment': 0.20,     # final verdict, often not tagged as "order"
+    'reasoning': 0.10,
+    'facts': 0.05,
+    'issues': 0.03,
+    'headnote': 0.02,
 }
 
 
@@ -228,6 +245,15 @@ class LegalRetriever:
             global_weight * global_scores + 
             section_weight * section_scores
         )
+
+        # Step 4b: Apply section-priority boosts
+        for idx, chunk in enumerate(chunks):
+            section = getattr(chunk, 'section', None) or ''
+            section_lower = section.lower()
+            for sec_key, boost in SECTION_BOOSTS.items():
+                if sec_key in section_lower:
+                    combined_scores[idx] += boost
+                    break
         
         # Step 5: Collect candidate chunks
         # Get top chunks from combined scoring
@@ -237,9 +263,15 @@ class LegalRetriever:
         intent_indices = set()
         for intent_list in intent_chunks.values():
             intent_indices.update(intent_list)
+
+        # Verdict anchor: always include the last 3 chunks of the document.
+        # Indian SC judgments almost always end with "Appeal Dismissed/Allowed"
+        # in the final paragraphs — similarity scoring alone may miss these.
+        n_tail = min(3, len(chunks))
+        tail_indices = set(range(len(chunks) - n_tail, len(chunks)))
         
         # Merge candidates
-        candidate_indices = set(top_combined.tolist()) | intent_indices
+        candidate_indices = set(top_combined.tolist()) | intent_indices | tail_indices
         candidate_indices = sorted(candidate_indices, 
                                   key=lambda i: combined_scores[i], 
                                   reverse=True)
@@ -367,3 +399,63 @@ def select_chunks(
         >>> selected = select_chunks(chunks, result.embeddings, top_n=10)
     """
     return _get_retriever().select_chunks(chunks, embeddings, top_n)
+
+
+def rank_sentences(
+    sentences: List[Dict[str, Any]],
+    top_n: int = 15,
+) -> List[Dict[str, Any]]:
+    """
+    Rank preprocessor sentences by relevance and return the top-N.
+
+    Each sentence dict should have at least {"text": str}.
+    Optionally include {"section": str} for section-priority boosting.
+
+    This embeds every sentence with InLegalBERT, scores them against
+    the legal intent queries + centroid + section boosts, and returns
+    the top-N ranked sentences in original document order.
+
+    Args:
+        sentences: List of {"id": int, "text": str, "section": str} dicts
+        top_n: Number of sentences to select
+
+    Returns:
+        List of selected sentence dicts
+    """
+    if not sentences or len(sentences) <= top_n:
+        return sentences
+
+    from pipeline.embedder import LegalEmbedder
+    from dataclasses import dataclass
+
+    # Wrap sentences as lightweight objects with .text and .section
+    @dataclass
+    class _Sent:
+        text: str
+        section: str
+        word_count: int
+        index: int
+
+    wrapped = [
+        _Sent(
+            text=s["text"],
+            section=s.get("section", ""),
+            word_count=len(s["text"].split()),
+            index=i,
+        )
+        for i, s in enumerate(sentences)
+    ]
+
+    # Embed
+    embedder = LegalEmbedder()
+    texts = [w.text for w in wrapped]
+    embeddings = embedder.embed_texts(texts)
+
+    # Use the retriever to select
+    retriever = _get_retriever()
+    selected = retriever.select_chunks(wrapped, embeddings, top_n=top_n)
+
+    # Return in original document order for narrative coherence
+    selected_indices = sorted([w.index for w in selected])
+    return [sentences[i] for i in selected_indices]
+
