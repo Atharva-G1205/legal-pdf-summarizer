@@ -179,6 +179,18 @@ class LegalSummarizer:
         """Max input tokens the underlying model accepts."""
         return 16384 if self.model_key == "led" else 1024
 
+    def _get_output_max(self) -> int:
+        """Max output tokens the decoder can produce.
+
+        LED's decoder positional embeddings are 1024; Pegasus's are also 1024.
+        We reserve 2 tokens for BOS/EOS special tokens.
+        """
+        max_pos = getattr(self.model.config, "max_decoder_position_embeddings", None)
+        if max_pos is None:
+            # Pegasus uses max_position_embeddings for the decoder
+            max_pos = getattr(self.model.config, "max_position_embeddings", 1024)
+        return max_pos - 2  # reserve BOS + EOS
+
     def _build_gen_kwargs(
         self,
         inputs: Any,
@@ -192,9 +204,16 @@ class LegalSummarizer:
         Aggressive repetition penalties cause entropy collapse →
         gibberish like "tchaffchaffchaffr".
         """
+        output_max = self._get_output_max()
+        clamped_max = min(max_length, output_max)
+        if clamped_max < max_length:
+            logger.warning(
+                f"Clamping max_new_tokens from {max_length} to {clamped_max} "
+                f"(decoder limit: {output_max + 2})"
+            )
         gen_kwargs: Dict[str, Any] = dict(
-            max_new_tokens=max_length,
-            min_new_tokens=max(1, min(min_length, max_length // 2)),
+            max_new_tokens=clamped_max,
+            min_new_tokens=max(1, min(min_length, clamped_max // 2)),
             num_beams=4,
             length_penalty=1.0,           # ↑ from 0.8 — finish thoughts, don't cut off
             no_repeat_ngram_size=2,       # ↓ from 3 — legal text repeats legitimately
