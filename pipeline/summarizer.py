@@ -215,11 +215,11 @@ class LegalSummarizer:
             max_new_tokens=clamped_max,
             min_new_tokens=max(1, min(min_length, clamped_max // 2)),
             num_beams=4,
-            length_penalty=1.0,           # ↑ from 0.8 — finish thoughts, don't cut off
+            length_penalty=1.8,           # AUDIT FIX: encourage fuller legal summaries.
             no_repeat_ngram_size=2,       # ↓ from 3 — legal text repeats legitimately
-            repetition_penalty=1.1,       # ↓ from 1.2 — less aggressive for legal prose
+            repetition_penalty=1.2,       # AUDIT FIX: reduce repetitive hallucinated loops.
             do_sample=False,
-            early_stopping=True,
+            early_stopping=False,         # AUDIT FIX: avoid beam stop before legal minimum detail.
         )
         # LED-specific: set global_attention on the metadata prefix
         # (first 64 tokens) so the model grounds on case/court/acts.
@@ -235,6 +235,15 @@ class LegalSummarizer:
     def _generate_once(self, text: str, max_length: int, min_length: int) -> str:
         """Single-pass generation (no overflow handling)."""
         input_max = self._get_input_max()
+        raw_input_tokens = len(self.tokenizer.encode(text, add_special_tokens=False))
+        # AUDIT FIX: expose silent truncation at tokenizer boundary.
+        if raw_input_tokens > input_max:
+            logger.warning(
+                "AUDIT: input tokens %d exceed %s limit %d; truncation will occur.",
+                raw_input_tokens,
+                self.model_key,
+                input_max,
+            )
         inputs = self.tokenizer(
             text,
             max_length=input_max,
@@ -286,9 +295,17 @@ class LegalSummarizer:
         if not text or not text.strip():
             return ""
 
+        # AUDIT FIX: enforce stronger minimum length for legal summaries.
+        min_length = max(150, min_length)
+
         # Prepend lightweight metadata prefix (not a verbose instruction)
         prefix = _build_metadata_prefix(grounding)
-        full_text = prefix + text
+        faithfulness_prefix = (
+            "Summarize the following extracted legal clauses faithfully and completely, "
+            "using only the information provided:\n\n"
+        )
+        # AUDIT FIX: add faithfulness instruction to reduce unsupported generation.
+        full_text = faithfulness_prefix + prefix + text
 
         # Check whether the input fits the model's context window
         input_max = self._get_input_max()
@@ -304,7 +321,7 @@ class LegalSummarizer:
                 f"({input_max} tokens). Switching to hierarchical mode."
             )
             summary = self._hierarchical_summarize(
-                text, prefix, max_length, min_length
+                text, faithfulness_prefix + prefix, max_length, min_length
             )
 
         if grounding:
@@ -403,8 +420,16 @@ class LegalSummarizer:
         Returns:
             :class:`SummaryResult`.
         """
-        combined = " ".join(s["text"] for s in sentences)
+        # AUDIT FIX: preserve sentence boundaries in stage handoff for model grounding.
+        combined = "\n".join(s["text"] for s in sentences)
         input_wc = len(combined.split())
+        input_tokens = len(self.tokenizer.encode(combined, add_special_tokens=False))
+        logger.info(
+            "AUDIT: stage2_input_tokens=%d model=%s input_word_count=%d",
+            input_tokens,
+            self.model_key,
+            input_wc,
+        )
 
         summary = self.summarize_text(combined, max_length, min_length, grounding=grounding)
 

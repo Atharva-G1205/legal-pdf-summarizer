@@ -66,7 +66,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--source", required=True,
-        help="Path to the source / reference file (.pdf or .txt).",
+        help="Path to the source document file (.pdf or .txt).",
+    )
+    parser.add_argument(
+        "--reference", required=False, default=None,
+        help="Path to reference summary file (.pdf or .txt) for ROUGE/BERTScore.",
     )
     parser.add_argument(
         "--summary", required=True,
@@ -97,9 +101,16 @@ def main() -> None:
     summary_text = _read_input(args.summary)
     print(f"    → {len(summary_text):,} characters extracted\n")
 
+    reference_text = None
+    if args.reference:
+        print("📚  Reading reference summary file ...")
+        reference_text = _read_input(args.reference)
+        print(f"    → {len(reference_text):,} characters extracted\n")
+
     results = evaluate_summary(
         source=source_text,
         summary=summary_text,
+        reference=reference_text,  # AUDIT FIX: lexical metrics should use reference summary.
         metrics=args.metrics,
         device=args.device,
     )

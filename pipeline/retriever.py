@@ -404,6 +404,7 @@ def select_chunks(
 def rank_sentences(
     sentences: List[Dict[str, Any]],
     top_n: int = 15,
+    min_selection_ratio: float = 0.4,
 ) -> List[Dict[str, Any]]:
     """
     Rank preprocessor sentences by relevance and return the top-N.
@@ -418,11 +419,20 @@ def rank_sentences(
     Args:
         sentences: List of {"id": int, "text": str, "section": str} dicts
         top_n: Number of sentences to select
+        min_selection_ratio: Minimum fraction of sentences to keep for
+            coverage-sensitive domains like legal documents.
 
     Returns:
         List of selected sentence dicts
     """
-    if not sentences or len(sentences) <= top_n:
+    if not sentences:
+        return []
+
+    # AUDIT FIX: enforce minimum extractive coverage to prevent severe recall loss.
+    effective_top_n = max(top_n, int(np.ceil(len(sentences) * min_selection_ratio)))
+    effective_top_n = min(effective_top_n, len(sentences))
+
+    if len(sentences) <= effective_top_n:
         return sentences
 
     from pipeline.embedder import LegalEmbedder
@@ -453,7 +463,7 @@ def rank_sentences(
 
     # Use the retriever to select
     retriever = _get_retriever()
-    selected = retriever.select_chunks(wrapped, embeddings, top_n=top_n)
+    selected = retriever.select_chunks(wrapped, embeddings, top_n=effective_top_n)
 
     # Return in original document order for narrative coherence
     selected_indices = sorted([w.index for w in selected])

@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -33,6 +34,8 @@ from pipeline.pdf_loader import PDFLoader
 from pipeline.preprocessor import TextPreprocessor
 from pipeline.retriever import rank_sentences
 from pipeline.summarizer import LegalSummarizer, SummaryResult
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -135,9 +138,16 @@ def run_pipeline(pdf_path: Path, config: SummaryConfig, model_source: str | None
 
     # 4. Rank with InLegalBERT -------------------------------------------
     _step("🧠", f"Ranking top {config.top_n} sentences (InLegalBERT)…")
-    top_sentences = rank_sentences(all_sentences, top_n=config.top_n)
+    # AUDIT FIX: keep >=40% sentences to improve coverage and recall in legal docs.
+    top_sentences = rank_sentences(
+        all_sentences,
+        top_n=config.top_n,
+        min_selection_ratio=0.4,
+    )
+    extraction_ratio = (len(top_sentences) / len(all_sentences)) if all_sentences else 0.0
     total_words = sum(len(s["text"].split()) for s in top_sentences)
     _ok(f"Selected {len(top_sentences)} sentences ({total_words:,} words)")
+    _ok(f"Extraction ratio: {extraction_ratio:.2%}")
 
     # 5. Generate summary ------------------------------------------------
     if config.model == "none":
@@ -167,6 +177,13 @@ def run_pipeline(pdf_path: Path, config: SummaryConfig, model_source: str | None
         max_length=config.max_length,
         min_length=config.min_length,
         grounding=grounding,
+    )
+    # AUDIT FIX: log handoff size to catch under-coverage or silent truncation risk.
+    logger.info(
+        "AUDIT: stage1_to_stage2 words=%d extraction_ratio=%.4f model=%s",
+        total_words,
+        extraction_ratio,
+        config.model,
     )
 
     return result.summary

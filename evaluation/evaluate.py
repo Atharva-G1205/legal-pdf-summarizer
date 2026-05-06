@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 def evaluate_summary(
     source: str,
     summary: str,
+    reference: str | None = None,
     *,
     metrics: list[str] | None = None,
     device: str | None = None,
@@ -29,8 +30,10 @@ def evaluate_summary(
     """Run one or more evaluation metrics and return combined results.
 
     Args:
-        source:   Source / reference document text.
+        source:   Source document text (used for faithfulness checks).
         summary:  Generated summary text.
+        reference: Optional reference summary text. If absent, falls back
+                  to source text for lexical metrics.
         metrics:  List of metric names to compute. Defaults to all three:
                   ``["rouge", "bertscore", "entailment"]``.
         device:   ``"cuda"`` / ``"cpu"`` / ``None`` (auto).
@@ -49,13 +52,22 @@ def evaluate_summary(
 
     results: Dict[str, Any] = {}
 
+    lexical_reference = reference if reference is not None else source
+    if reference is None:
+        logger.warning(
+            "AUDIT FLAG: No reference summary provided; ROUGE/BERTScore are computed "
+            "against source text, which can suppress recall."
+        )
+
     if "rouge" in metrics:
         logger.info("Computing ROUGE scores ...")
-        results["rouge"] = compute_rouge(source, summary)
+        # AUDIT FIX: compute lexical metrics against reference summary.
+        results["rouge"] = compute_rouge(lexical_reference, summary)
 
     if "bertscore" in metrics:
         logger.info("Computing BERTScore ...")
-        results["bertscore"] = compute_bertscore(source, summary, device=device)
+        # AUDIT FIX: compute lexical/semantic overlap against reference summary.
+        results["bertscore"] = compute_bertscore(lexical_reference, summary, device=device)
 
     if "entailment" in metrics:
         logger.info("Computing Entailment / Faithfulness ...")
